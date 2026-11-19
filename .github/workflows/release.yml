@@ -52,7 +52,7 @@ jobs:
         run: cargo update
 
       - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
 
       - name: Build (${{ matrix.target }}, release)
         run: cargo build --release --target ${{ matrix.target }} --locked
