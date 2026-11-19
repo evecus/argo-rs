@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8.9"
 base64 = "0.23.1"
 bytes = "1.12.2"
 capnp = "0.20"
@@ -16,6 +15,7 @@ futures = "0.3.34"
 hickory-resolver = "0.26.3"
 h2 = "0.4.20"
 http = "1"
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "platform-verifier", "log", "bloom", "futures-io"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 rustls-pemfile = "2.2.0"

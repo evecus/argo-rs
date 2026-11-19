@@ -4,16 +4,22 @@ use crate::rpc::Registration;
 use crate::stream::QuinnDuplex;
 use crate::token::TunnelToken;
 use crate::tls;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// 跑一条 QUIC 隧道连接。`shutdown` 触发时注销并返回 Ok；
+/// 与 edge 断开则返回 Err，由上层负责重连。注册成功时调用一次 `on_registered`。
 pub async fn run(
     edge: SocketAddr,
+    conn_index: u8,
     token: &TunnelToken,
     secret: &[u8],
     config: Arc<ConfigStore>,
+    shutdown: CancellationToken,
+    on_registered: &dyn Fn(),
 ) -> Result<()> {
     let tls_config = tls::build_client_config(vec![b"argotunnel".to_vec()])?;
     let quic_client_config = quinn::ClientConfig::new(Arc::new(
@@ -21,7 +27,7 @@ pub async fn run(
             .context("构造 QUIC TLS 配置失败")?,
     ));
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?).context("创建 QUIC endpoint 失败")?;
+    let mut endpoint = quinn::Endpoint::client(if edge.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }.parse()?).context("创建 QUIC endpoint 失败")?;
     endpoint.set_default_client_config(quic_client_config);
 
     info!(%edge, "连接 Cloudflare edge (QUIC)");
@@ -37,15 +43,13 @@ pub async fn run(
 
     // 官方 quicConnection.Serve：第一条双向流固定作为控制流。
     let (send, recv) = connection.open_bi().await.context("打开控制流失败")?;
-    let (registration, info) = Registration::register(recv, send, token, secret, 0).await?;
+    let (registration, info) = Registration::register(recv, send, token, secret, conn_index).await?;
+    on_registered();
     info!(
         location = %info.location,
         connection_id = %info.uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
         "隧道注册成功"
     );
-
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
 
     let edge_closed;
     loop {
@@ -60,14 +64,15 @@ pub async fn run(
                     }
                 };
                 let cfg = config.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = proxy::serve_data_stream(QuinnDuplex::new(recv, send), cfg).await {
-                        warn!(%e, "处理数据流转代理请求失败");
+                // capnp RPC（远程配置）依赖 LocalSet，因此按签名分派的这一步在本地任务里做。
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_stream(recv, send, cfg).await {
+                        warn!(error = format!("{:#}", e), "处理 edge 流失败");
                     }
                 });
             }
-            _ = &mut ctrl_c => {
-                info!("收到 Ctrl-C，正在注销隧道连接");
+            _ = shutdown.cancelled() => {
+                info!("正在注销隧道连接");
                 if let Err(e) = registration.unregister().await {
                     warn!(error = format!("{:#}", e), "注销失败");
                 }
@@ -83,5 +88,28 @@ pub async fn run(
     if edge_closed {
         anyhow::bail!("与 edge 的连接已断开");
     }
+    Ok(())
+}
+
+/// 读 6 字节签名：RPC 流 → 接收远程配置；数据流 → 转交多线程运行时做 HTTP/WebSocket 代理。
+async fn handle_stream(
+    mut recv: quinn::RecvStream,
+    send: quinn::SendStream,
+    config: Arc<ConfigStore>,
+) -> Result<()> {
+    let mut signature = [0u8; 6];
+    recv.read_exact(&mut signature).await.context("读取流签名失败")?;
+    if signature == proxy::RPC_SIGNATURE {
+        return crate::rpc::serve_rpc_stream(recv, send, config).await;
+    }
+    if signature != proxy::DATA_SIGNATURE {
+        bail!("未知的流协议签名");
+    }
+    // 数据流可能长时间存活（WebSocket），放到多线程运行时，避免占用单线程 LocalSet。
+    tokio::spawn(async move {
+        if let Err(e) = proxy::serve_data_stream(QuinnDuplex::new(recv, send), config).await {
+            warn!(error = format!("{:#}", e), "处理数据流转代理请求失败");
+        }
+    });
     Ok(())
 }

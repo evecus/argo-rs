@@ -1,6 +1,0 @@
-{
-  "default_port": 8080,
-  "routes": [
-    { "hostname": "test.evec.us.ci", "path_prefix": "", "port": 8080 }
-  ]
-}

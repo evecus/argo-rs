@@ -1,4 +1,7 @@
+use crate::config::ConfigStore;
 use crate::token::TunnelToken;
+use capnp::capability::Promise;
+use std::sync::Arc;
 use anyhow::{Context, Result};
 use capnp::message::ReaderOptions;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -157,4 +160,52 @@ impl Registration {
         self.task.abort();
         Ok(())
     }
+}
+
+/// edge 作为 RPC 客户端调用本进程的 CloudflaredServer（SessionManager + ConfigurationManager）。
+/// 精简版只实现 updateConfiguration；UDP session 相关方法走生成代码的默认实现（返回 unimplemented）。
+struct ConfigServer {
+    store: Arc<ConfigStore>,
+}
+
+impl schema::session_manager::Server for ConfigServer {}
+
+impl schema::configuration_manager::Server for ConfigServer {
+    fn update_configuration(
+        &mut self,
+        params: schema::configuration_manager::UpdateConfigurationParams,
+        mut results: schema::configuration_manager::UpdateConfigurationResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = capnp_rpc::pry!(params.get());
+        let version = params.get_version();
+        let config = capnp_rpc::pry!(params.get_config());
+        let (applied, err) = self.store.update(version, config);
+        let mut result = results.get().init_result();
+        result.set_latest_applied_version(applied);
+        if let Some(err) = err {
+            result.set_err(err.as_str());
+        }
+        Promise::ok(())
+    }
+}
+
+impl schema::cloudflared_server::Server for ConfigServer {}
+
+/// 在 edge 打开的 RPC 流上提供 CloudflaredServer。签名（6 字节）已被调用方读掉。
+/// 必须在 tokio LocalSet 内运行。
+pub async fn serve_rpc_stream<R, W>(reader: R, writer: W, store: Arc<ConfigStore>) -> Result<()>
+where
+    R: futures::AsyncRead + Unpin + 'static,
+    W: futures::AsyncWrite + Unpin + 'static,
+{
+    let network = Box::new(VatNetwork::new(
+        futures::io::BufReader::new(reader),
+        futures::io::BufWriter::new(writer),
+        Side::Server,
+        ReaderOptions::new(),
+    ));
+    let server: schema::cloudflared_server::Client = capnp_rpc::new_client(ConfigServer { store });
+    let rpc_system = RpcSystem::new(network, Some(server.client));
+    rpc_system.await.context("edge RPC 流异常结束")?;
+    Ok(())
 }

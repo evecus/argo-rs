@@ -17,17 +17,20 @@ mod proxy;
 mod quic;
 mod rpc;
 mod stream;
+mod supervisor;
 mod token;
 mod tls;
-mod web;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::ConfigStore;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 use tokio::task::LocalSet;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use token::TunnelToken;
 use tracing::{info, warn};
 
@@ -49,15 +52,12 @@ struct Args {
     /// 边缘传输协议：auto（QUIC 优先，失败回退 HTTP/2，默认）、quic、http2
     #[arg(long, default_value = "auto", value_parser = ["auto", "quic", "http2"])]
     protocol: String,
-    /// 本地配置网页监听地址
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    web_addr: SocketAddr,
-    /// 路由配置文件路径
-    #[arg(long, default_value = "routes.json")]
-    config: PathBuf,
+    /// 到 edge 的并行隧道连接数（官方默认 4）
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
+    ha_connections: u8,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -81,74 +81,77 @@ async fn main() -> Result<()> {
         "token 解析成功"
     );
 
-    let store = Arc::new(ConfigStore::load(&args.config)?);
-    let web_store = store.clone();
-    tokio::spawn(async move {
-        if let Err(e) = web::serve(web_store, args.web_addr).await {
-            warn!(%e, "配置页面启动失败");
-        }
-    });
+    // 路由由 Cloudflare 控制台管理：edge 注册成功后会推送 ingress 配置。
+    let store = Arc::new(ConfigStore::new());
 
-    let edges = match &args.edge {
-        Some(edge) => discovery::resolve_override(edge).await?,
+    let regions: Vec<Vec<SocketAddr>> = match &args.edge {
+        Some(edge) => vec![discovery::resolve_override(edge).await?],
         None => {
-            let mut addrs = discovery::discover_edges(args.region.as_deref()).await?;
             if let Some(endpoint) = &tunnel_token.endpoint {
                 info!(%endpoint, "token 中携带 endpoint，仍使用 SRV 发现结果");
             }
-            // 就近优先：IPv4 放前面，减少 QUIC 初始包差异带来的兼容问题。
-            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
-            addrs
+            discovery::discover_edges(args.region.as_deref()).await?
         }
     };
 
-    let use_quic = args.protocol != "http2";
-    let allow_fallback = args.protocol == "auto";
+    let protocol = match args.protocol.as_str() {
+        "quic" => supervisor::Protocol::Quic,
+        "http2" => supervisor::Protocol::Http2,
+        _ => supervisor::Protocol::Auto,
+    };
+    let shared = Arc::new(supervisor::Shared {
+        pool: discovery::EdgePool::new(regions),
+        token: tunnel_token,
+        secret,
+        config: store,
+        protocol,
+        use_h2: AtomicBool::new(protocol == supervisor::Protocol::Http2),
+        quic_fail_streak: AtomicU32::new(0),
+    });
+    let n = args.ha_connections as usize;
 
     let local = LocalSet::new();
     local
         .run_until(async move {
-            // 先按 QUIC 尝试所有 edge；auto 模式下全部失败再整体回退 HTTP/2。
-            // 这与官方 protocolSelector(auto) 的语义一致：以 QUIC 起步，
-            // 连接不可用时才切到 HTTP/2（TCP 7844）。
-            let mut attempts: Vec<(bool, String)> = Vec::new();
-            if use_quic {
-                attempts.push((true, "QUIC".into()));
-            }
-            if allow_fallback || args.protocol == "http2" {
-                attempts.push((false, "HTTP/2".into()));
-            }
+            let shutdown = CancellationToken::new();
+            let handles: Vec<_> = (0..n)
+                .map(|idx| {
+                    tokio::task::spawn_local(
+                        supervisor::run_connection(idx, shared.clone(), shutdown.clone())
+                            .instrument(tracing::info_span!("conn", idx)),
+                    )
+                })
+                .collect();
+            info!(connections = n, "已启动隧道连接");
 
-            let mut last_err = None;
-            for (quic_mode, label) in attempts {
-                info!(%label, "开始尝试边缘传输协议");
-                // auto 模式下 QUIC 只试前 2 个 edge：UDP 被丢弃时每个握手有 5s
-                // 超时，若对全部 40 个 edge 都试一遍才回退，等待时间不可接受。
-                // 强制 --protocol quic 时仍会遍历全部 edge。
-                let pool: Vec<_> = if quic_mode && allow_fallback {
-                    edges.iter().take(2).collect()
-                } else {
-                    edges.iter().collect()
-                };
-                for edge in pool {
-                    let result = if quic_mode {
-                        quic::run(*edge, &tunnel_token, &secret, store.clone()).await
-                    } else {
-                        h2::run(*edge, &tunnel_token, &secret, store.clone()).await
-                    };
-                    match result {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            warn!(%e, %edge, %label, "该 edge 连接失败，尝试下一个");
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                if quic_mode && allow_fallback {
-                    warn!("QUIC 连接失败，回退到 HTTP/2 (TCP 7844)");
-                }
+            wait_for_signal().await;
+            info!("收到退出信号，正在注销全部连接");
+            shutdown.cancel();
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                futures::future::join_all(handles),
+            )
+            .await
+            .is_err()
+            {
+                warn!("等待注销超时，强制退出");
             }
-            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用的 edge 地址")))
+            Ok(())
         })
         .await
+}
+
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

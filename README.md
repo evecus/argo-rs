@@ -2,7 +2,10 @@
 
 参考官方 `cloudflared` 源码（2026.11.1）用 Rust 重写的精简版 Cloudflare Tunnel 客户端。目标：**用官方 token 连上 Cloudflare edge、完成注册、保持连接、优雅注销**，本地网页配置路由端口，支持基础 HTTP / WebSocket 数据转发，并实现 **QUIC 优先、HTTP/2 回退** 的双传输（`--protocol auto`，默认）。
 
-## 已验证（用真实 token 实测通过）
+> 注意：下面的“已验证”记录来自单连接 + 本地路由文件的旧版本。多连接（HA）与远程路由配置为后续改动，
+> 其中 `config.rs` 的规则匹配有单元测试，其余需要真实 token 联调。
+
+## 已验证（旧版本，用真实 token 实测通过）
 
 ```
 token 解析成功 tunnel_id=97425bba-... account_tag=0de1bc7f...
@@ -101,41 +104,32 @@ cargo build --release
 ## 运行
 
 ```bash
-./target/release/argo-rs --token '<官方 tunnel token>'
-# 或
-./target/release/argo-rs --token-file ./token.txt \
-    --config ./routes.json --web-addr 127.0.0.1:8080
+./argo-rs --token '<官方 tunnel token>'
 ```
+
+只需要 token。**路由在 Cloudflare 控制台里配置**（Zero Trust → Networks → Tunnels → 你的隧道 → Public Hostname），
+改完 edge 会自动推送给本进程，无需本地配置文件，也没有本地配置网页。
 
 | 参数 | 说明 |
 |---|---|
 | `--token` / `--token-file` | 官方 tunnel token，二选一 |
-| `--protocol <auto\|quic\|http2>` | 边缘传输协议，默认 `auto`（QUIC 优先，失败回退 HTTP/2） |
+| `--ha-connections <1-8>` | 到 edge 的并行连接数，默认 4（与官方一致） |
+| `--protocol <auto\|quic\|http2>` | 默认 `auto`：QUIC 优先，注册前连续失败 2 次后全部连接回退 HTTP/2 |
 | `--region` | 指定 edge 区域（默认查全局 SRV） |
 | `--edge host:port` | 手动指定 edge，跳过 SRV 发现（调试用） |
-| `--web-addr` | 本地配置页监听地址，默认 `127.0.0.1:8080` |
-| `--config` | 路由配置 JSON 路径，默认 `routes.json` |
 
-`--protocol auto`（默认）先尝试 QUIC（前 2 个 edge，每个握手 5s 超时）；UDP 不可用时
-自动回退到 HTTP/2 over TCP 7844。`quic` / `http2` 强制单一协议。两者共用同一套 token、
-注册 RPC 与路由配置。
+### 多连接（HA）
 
-token 解析后只打印 `tunnel_id` / `account_tag`，secret 全程不落日志。
+- 默认 4 条连接，各带独立 `connIndex`（0–3），分散到 SRV 返回的两个 region、不同 IP。
+- 启动时每条错峰 1 秒；某条断开后只重连自己（指数退避 1s→60s，带抖动），不影响其它连接。
+- Ctrl-C / SIGTERM：对所有连接并行注销后退出（最多等 10 秒）。
 
-## 路由配置
+### 远程路由配置
 
-浏览器打开 `http://127.0.0.1:8080`，直接编辑 JSON：
-
-```json
-{
-  "default_port": 8080,
-  "routes": [
-    { "hostname": "demo.example.com", "path_prefix": "/api", "port": 3000 }
-  ]
-}
-```
-
-`hostname` 可用 `*` 表示默认；`path_prefix` 为空匹配全部。按 hostname + 最长路径前缀匹配，命中后转发到对应本机端口。保存即写盘并即时生效。
+- 支持 service：`http://host[:port]`、`http_status:NNN`；支持 `hostname`（含 `*.example.com`）、`path`（正则）、`originRequest.httpHostHeader`。
+- 规则按顺序取第一条匹配，都不匹配用最后一条；未收到任何配置前统一返回 503（与官方一致）。
+- 其它 service（`https://`、`unix:`、`tcp://`、`ssh://` 等）不支持：匹配到时返回 502 并在日志里提示。
+- 版本号不高于当前版本的推送会被忽略；配置非法时保留旧配置并向 edge 回报错误。
 
 ## 模块结构
 
@@ -147,16 +141,16 @@ token 解析后只打印 `tunnel_id` / `account_tag`，secret 全程不落日志
 | `src/quic.rs` | QUIC 连接、控制流、主循环、优雅注销（5s 握手超时） |
 | `src/h2.rs` | HTTP/2 传输：TCP+TLS+H2 server、control-stream 注册、HTTP/WS 数据面 |
 | `src/h2io.rs` | h2 流 ↔ futures AsyncRead/Write 适配（含流控窗口管理） |
-| `src/rpc.rs` | Cap'n Proto RPC：注册/注销（复用官方 schema type ID，QUIC/H2 共用） |
+| `src/rpc.rs` | Cap'n Proto RPC：注册/注销；QUIC 上接收 `updateConfiguration`（复用官方 schema，QUIC/H2 共用） |
 | `src/proxy.rs` | QUIC 数据流：6 字节签名 + `ConnectRequest` 解析 → HTTP 反代 |
-| `src/web.rs` / `src/config.rs` | 内嵌配置页与路由热更新 |
+| `src/config.rs` | 远程下发的 ingress 规则解析与匹配（含单元测试） |
+| `src/supervisor.rs` | HA 多连接：每连接独立任务、退避重连、协议回退 |
 | `src/schema/*.capnp` | 从官方源码原样复制的 proto 定义 |
 
 ## 已知限制 / 未实现
 
 - 数据面为精简 HTTP/1.1 反代 + WebSocket 升级/双向透传，QUIC 与 HTTP/2 两条传输均已实测；未实现 UDP datagram、裸 TCP 透传
 - WebSocket 透传为逐字节 copy，不做帧解析/压缩扩展（permessage-deflate 由 origin 自行协商）
-- 未实现远程配置下发、多连接 HA、自动更新、指标上报
-- HTTP/2 的 `update-configuration` / edge 反向 RPC 请求未处理（精简版忽略）；配置仅本地网页维护
+- 未实现自动更新、指标上报
 - H2 数据面按官方头序列化规则处理；`auto` 模式 QUIC 只试前 2 个 edge 以保证回退及时（强制 `--protocol quic` 才遍历全部）
 - 注销时 edge 收到请求后立即断开控制流、不回正常 response：QUIC 下 capnp 报 `Disconnected`、H2 下报 `stream closed`，本实现均识别为「注销已接受」

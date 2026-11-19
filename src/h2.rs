@@ -9,7 +9,7 @@
 //! 用户 HTTP/1 头被序列化进 `cf-cloudflared-request-headers`，响应头序列化进
 //! `cf-cloudflared-response-headers`（base64 RawStd，`key:value;` 串接）。
 
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, Service};
 use crate::h2io::{H2Reader, H2Writer};
 use crate::proxy::{parse_http_response, read_response_head};
 use crate::rpc::Registration;
@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -38,14 +39,18 @@ const RESPONSE_HEADERS: &str = "cf-cloudflared-response-headers";
 const RESPONSE_META: &str = "cf-cloudflared-response-meta";
 const CONTROL_STREAM: &str = "control-stream";
 const WEBSOCKET: &str = "websocket";
+const CONFIG_UPDATE: &str = "update-configuration";
 const RESPONSE_META_ORIGIN: &str = r#"{"src":"origin","flow_rate_limited":false}"#;
 
 /// 建立到 edge 的 H2 连接，跑控制流注册，然后持续接受 edge 发起的数据流请求。
 pub async fn run(
     edge: SocketAddr,
+    conn_index: u8,
     token: &TunnelToken,
     secret: &[u8],
     config: Arc<ConfigStore>,
+    shutdown: CancellationToken,
+    on_registered: &dyn Fn(),
 ) -> Result<()> {
     // 官方 H2 TLS：SNI h2.cftunnel.com，不设置 ALPN（TLSSettings.NextProtos 为空）。
     let tls_config = tls::build_client_config(vec![])?;
@@ -93,9 +98,6 @@ pub async fn run(
         }
     });
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
     let mut registration: Option<Registration> = None;
     let mut edge_closed = false;
 
@@ -120,13 +122,14 @@ pub async fn run(
                     // 控制流必须就地跑完注册：capnp 的 spawn_local 依赖当前
                     // LocalSet 上下文，不能丢进普通 tokio::spawn 任务。
                     CONTROL_STREAM => {
-                        match serve_control_stream(request, respond, token, secret).await {
+                        match serve_control_stream(request, respond, token, secret, conn_index).await {
                             Ok((reg, info)) => {
                                 info!(
                                     location = %info.location,
                                     connection_id = %hex(&info.uuid),
                                     "隧道注册成功 (HTTP/2)"
                                 );
+                                on_registered();
                                 registration = Some(reg);
                             }
                             Err(e) => {
@@ -135,6 +138,14 @@ pub async fn run(
                                 break;
                             }
                         }
+                    }
+                    CONFIG_UPDATE => {
+                        let cfg = config.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = serve_config_update(request, respond, cfg).await {
+                                warn!(error = format!("{:#}", e), "处理远程配置更新失败");
+                            }
+                        });
                     }
                     _ => {
                         let is_ws = upgrade.eq_ignore_ascii_case(WEBSOCKET);
@@ -147,8 +158,8 @@ pub async fn run(
                     }
                 }
             }
-            _ = &mut ctrl_c => {
-                info!("收到 Ctrl-C，正在注销隧道连接 (HTTP/2)");
+            _ = shutdown.cancelled() => {
+                info!("正在注销隧道连接 (HTTP/2)");
                 break;
             }
         }
@@ -176,6 +187,7 @@ async fn serve_control_stream(
     mut respond: SendResponse<Bytes>,
     token: &TunnelToken,
     secret: &[u8],
+    conn_index: u8,
 ) -> Result<(Registration, crate::rpc::ConnectionInfo)> {
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -187,7 +199,46 @@ async fn serve_control_stream(
 
     let reader = H2Reader::new(request.into_body());
     let writer = H2Writer::new(send_stream);
-    Registration::register(reader, writer, token, secret, 0).await
+    Registration::register(reader, writer, token, secret, conn_index).await
+}
+
+/// edge 推送远程配置：请求体 `{"version":N,"config":{...}}`，响应 `{"lastAppliedVersion":N,"err":null}`。
+async fn serve_config_update(
+    request: Request<RecvStream>,
+    respond: SendResponse<Bytes>,
+    config: Arc<ConfigStore>,
+) -> Result<()> {
+    let mut reader = H2Reader::new(request.into_body());
+    let mut body = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = futures::AsyncReadExt::read(&mut reader, &mut tmp)
+            .await
+            .context("读取配置更新请求体失败")?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UpdateBody {
+        version: i32,
+        config: serde_json::Value,
+    }
+    let parsed: UpdateBody = serde_json::from_slice(&body).context("配置更新请求体不是合法 JSON")?;
+    let raw = serde_json::to_vec(&parsed.config)?;
+    let (applied, err) = config.update(parsed.version, &raw);
+    // 与官方 pogs 的 JSON 形态一致：err 为 nil 时 null，否则是 Go error 序列化出的 {}。
+    let resp = serde_json::json!({
+        "lastAppliedVersion": applied,
+        "err": err.map(|_| serde_json::json!({})),
+    });
+    let resp_body = serde_json::to_vec(&resp)?;
+    let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    let send_stream = write_h2_response(respond, 200, &headers, &resp_body, false).await?;
+    drop(send_stream);
+    Ok(())
 }
 
 /// 单条 H2 数据流：解析伪头与序列化请求头 → 转发到本机 origin → 把响应头
@@ -233,13 +284,30 @@ async fn serve_data_stream(
         .or_else(|| header(&request, "host"))
         .unwrap_or_default();
 
-    let port = config.resolve_port(&host, &path);
+    let target = config.resolve(&host, &path);
     let recv = request.into_body();
-    debug!(%host, %path, port, is_ws, "H2 转发到本地端口");
+    let (origin_host, port, host) = match target.service {
+        Service::Http { host: origin_host, port } => {
+            (origin_host, port, target.host_header.unwrap_or(host))
+        }
+        Service::Status(code) => {
+            debug!(%host, %path, code, "命中 http_status 规则");
+            let send_stream = write_h2_response(respond, code, &[], b"", false).await?;
+            drop(send_stream);
+            return Ok(());
+        }
+        Service::Unsupported(service) => {
+            warn!(%service, %host, "命中不受支持的 ingress service，返回 502");
+            let send_stream = write_h2_response(respond, 502, &[], b"", false).await?;
+            drop(send_stream);
+            return Ok(());
+        }
+    };
+    debug!(%host, %path, %origin_host, port, is_ws, "H2 转发到 origin");
 
-    let upstream = TcpStream::connect(("127.0.0.1", port))
+    let upstream = TcpStream::connect((origin_host.as_str(), port))
         .await
-        .with_context(|| format!("连接本机端口 {} 失败", port))?;
+        .with_context(|| format!("连接 origin {}:{} 失败", origin_host, port))?;
 
     if is_ws {
         serve_websocket(&method, &path, &host, &headers, upstream, recv, respond).await

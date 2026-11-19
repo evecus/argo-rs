@@ -1,4 +1,4 @@
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, Service};
 use crate::quic_metadata_protocol_capnp as quic_schema;
 use crate::stream::QuinnDuplex;
 use anyhow::{bail, Context, Result};
@@ -13,9 +13,9 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 /// 官方 tunnelrpc/quic/protocol.go 里的流签名与版本。
-const DATA_SIGNATURE: [u8; 6] = [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E];
-/// edge 反向调用 cloudflared 的 RPC 流（配置管理等），精简版不实现，识别后安静关闭。
-const RPC_SIGNATURE: [u8; 6] = [0x52, 0xBB, 0x82, 0x5C, 0xDB, 0x65];
+pub(crate) const DATA_SIGNATURE: [u8; 6] = [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E];
+/// edge 反向调用 cloudflared 的 RPC 流（远程配置下发），由 quic.rs 按签名分派给 rpc.rs。
+pub(crate) const RPC_SIGNATURE: [u8; 6] = [0x52, 0xBB, 0x82, 0x5C, 0xDB, 0x65];
 const PROTOCOL_VERSION: &[u8] = b"01";
 
 /// websocket 升级需要传给 origin 的 RFC6455 GUID（用于校验响应，实际 Accept 由 origin 计算）。
@@ -29,6 +29,7 @@ struct RequestInfo {
     method: String,
     host: String,
     path: String,
+    origin_host: String,
     port: u16,
     metadata: HashMap<String, String>,
 }
@@ -44,6 +45,7 @@ fn split_url(dest: &str) -> (String, String) {
     }
 }
 
+/// 调用前 quic.rs 已读掉 6 字节数据流签名，这里从 2 字节版本号开始。
 pub async fn serve_data_stream(stream: QuinnDuplex, config: Arc<ConfigStore>) -> Result<()> {
     let mut reader = BufReader::new(stream.recv);
     let mut writer = BufWriter::new(stream.send);
@@ -63,16 +65,9 @@ async fn read_and_dispatch(
     writer: &mut EdgeWriter,
     config: &ConfigStore,
 ) -> Result<bool> {
-    let mut preamble = [0u8; 8];
-    reader.read_exact(&mut preamble).await.context("读取流前导失败")?;
-    if preamble[..6] == RPC_SIGNATURE {
-        debug!("收到 edge 反向 RPC 流，精简版不处理，已关闭");
-        return Ok(false);
-    }
-    if preamble[..6] != DATA_SIGNATURE {
-        bail!("未知的数据流协议签名");
-    }
-    if &preamble[6..] != PROTOCOL_VERSION {
+    let mut version = [0u8; 2];
+    reader.read_exact(&mut version).await.context("读取流版本失败")?;
+    if &version[..] != PROTOCOL_VERSION {
         bail!("不支持的数据流协议版本");
     }
 
@@ -106,13 +101,30 @@ async fn read_and_dispatch(
         .get("HttpHost")
         .cloned()
         .unwrap_or_else(|| url_host.clone());
-    let port = config.resolve_port(&host, &path_and_query);
-    debug!(%host, %path_and_query, port, ?connection_type, "转发到本地端口");
+    let target = config.resolve(&host, &path_and_query);
+    let (origin_host, port, host) = match target.service {
+        Service::Http { host: origin_host, port } => {
+            (origin_host, port, target.host_header.unwrap_or(host))
+        }
+        Service::Status(code) => {
+            debug!(%host, %path_and_query, code, "命中 http_status 规则");
+            write_connect_response(writer, code, &[]).await?;
+            writer.flush().await?;
+            return Ok(false);
+        }
+        Service::Unsupported(service) => {
+            warn!(%service, %host, "命中不受支持的 ingress service，返回 502");
+            write_error(writer, 502, "unsupported ingress service").await?;
+            return Ok(false);
+        }
+    };
+    debug!(%host, %path_and_query, %origin_host, port, ?connection_type, "转发到 origin");
 
     let info = RequestInfo {
         method,
         host,
         path: path_and_query,
+        origin_host,
         port,
         metadata,
     };
@@ -141,9 +153,9 @@ async fn serve_http(reader: &mut EdgeReader, writer: &mut EdgeWriter, info: Requ
         reader.read_exact(&mut body).await.context("读取请求体失败")?;
     }
 
-    let mut upstream = TcpStream::connect(("127.0.0.1", info.port))
+    let mut upstream = TcpStream::connect((info.origin_host.as_str(), info.port))
         .await
-        .with_context(|| format!("连接本机端口 {} 失败", info.port))?;
+        .with_context(|| format!("连接 origin {}:{} 失败", info.origin_host, info.port))?;
 
     let mut headers = String::new();
     headers.push_str(&format!("{} {} HTTP/1.1\r\n", info.method, info.path));
@@ -171,9 +183,9 @@ async fn serve_websocket(
     writer: &mut EdgeWriter,
     info: RequestInfo,
 ) -> Result<()> {
-    let mut upstream = TcpStream::connect(("127.0.0.1", info.port))
+    let mut upstream = TcpStream::connect((info.origin_host.as_str(), info.port))
         .await
-        .with_context(|| format!("连接本机端口 {} 失败", info.port))?;
+        .with_context(|| format!("连接 origin {}:{} 失败", info.origin_host, info.port))?;
 
     // 官方 proxyHTTPRequest：websocket 请求无 body，并补齐缺失的升级头。
     // edge 通常已透传 Sec-WebSocket-Key/Version/Upgrade/Connection，重复追加会导致
