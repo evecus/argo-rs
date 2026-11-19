@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as TokioReadExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 /// 对齐官方默认：keepAliveConnections=100。
@@ -21,10 +22,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const STREAM_CHUNK: usize = 16 * 1024;
 
 /// 一条到 origin 的 HTTP/1.1 连接：writer 直写 socket，reader 带缓冲读响应。
-/// 两个句柄指向同一 socket（try_clone），响应体读完后可整体回池复用。
+/// 读写两半由 into_split 拆出（指向同一 socket），响应体读完后可整体回池复用。
 pub struct OriginConn {
-    pub writer: TcpStream,
-    pub reader: BufReader<TcpStream>,
+    pub writer: OwnedWriteHalf,
+    pub reader: BufReader<OwnedReadHalf>,
 }
 
 impl OriginConn {
@@ -32,10 +33,10 @@ impl OriginConn {
         let stream = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("连接 origin {host}:{port} 失败"))?;
-        let writer = stream.try_clone().context("克隆 origin socket 失败")?;
+        let (read_half, write_half) = stream.into_split();
         Ok(Self {
-            writer,
-            reader: BufReader::new(stream),
+            writer: write_half,
+            reader: BufReader::new(read_half),
         })
     }
 }
@@ -75,9 +76,7 @@ impl OriginPool {
     /// 归还一条仍可复用的连接；超出每主机空闲上限时直接丢弃。
     pub fn checkin(&self, host: &str, port: u16, conn: OriginConn) {
         let mut conns = self.conns.lock().unwrap();
-        let bucket = conns
-            .entry((host.to_string(), port))
-            .or_insert_with(Vec::new);
+        let bucket = conns.entry((host.to_string(), port)).or_default();
         if bucket.len() >= MAX_IDLE_PER_HOST {
             return;
         }

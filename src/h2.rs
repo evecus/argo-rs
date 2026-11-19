@@ -306,11 +306,29 @@ async fn serve_data_stream(
     };
     debug!(%host, %path, %origin_host, port, is_ws, "H2 转发到 origin");
 
+    let req = OriginRequest {
+        method: &method,
+        path: &path,
+        host: &host,
+        headers: &headers,
+        origin_host: &origin_host,
+        port,
+    };
     if is_ws {
-        serve_websocket(&method, &path, &host, &headers, origin_host, port, recv, respond).await
+        serve_websocket(req, recv, respond).await
     } else {
-        serve_http(&method, &path, &host, &headers, origin_host, port, recv, respond).await
+        serve_http(req, recv, respond).await
     }
+}
+
+/// 发往 origin 的一次请求要素（打包避免 serve_http/serve_websocket 参数过多）。
+struct OriginRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    host: &'a str,
+    headers: &'a [(String, String)],
+    origin_host: &'a str,
+    port: u16,
 }
 
 /// 取一条可用 origin 连接并发请求、读响应头：优先复用池内 keep-alive 连接，
@@ -341,15 +359,18 @@ async fn send_origin_request(conn: &mut OriginConn, head: &[u8], body: &[u8]) ->
 }
 
 async fn serve_http(
-    method: &str,
-    path: &str,
-    host: &str,
-    headers: &[(String, String)],
-    origin_host: String,
-    port: u16,
+    req: OriginRequest<'_>,
     recv: RecvStream,
     respond: SendResponse<Bytes>,
 ) -> Result<()> {
+    let OriginRequest {
+        method,
+        path,
+        host,
+        headers,
+        origin_host,
+        port,
+    } = req;
     // 读请求体（H2 用流结束标记界定长度）。
     let mut body = Vec::new();
     let mut reader = H2Reader::new(recv);
@@ -364,18 +385,19 @@ async fn serve_http(
         body.extend_from_slice(&tmp[..n]);
     }
 
-    let mut req = build_origin_request(method, path, host, headers, false);
-    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    let mut req_bytes = build_origin_request(method, path, host, headers, false);
+    req_bytes.push_str(&format!("Content-Length: {}\r\n", body.len()));
     // 不发 Connection: close，HTTP/1.1 默认 keep-alive，连接可回池复用。
-    req.push_str("\r\n");
+    req_bytes.push_str("\r\n");
 
     // 连接/发送/读响应头失败统一回 502：访客拿到明确的网关错误而不是断流。
-    let (mut conn, head) = match request_origin(&origin_host, port, req.as_bytes(), &body).await {
+    let (mut conn, head) = match request_origin(origin_host, port, req_bytes.as_bytes(), &body).await
+    {
         Ok(ok) => ok,
         Err(e) => {
             warn!(error = format!("{e:#}"), "origin 请求失败，返回 502");
             let send_stream =
-                write_h2_response(respond, 502, &[], b"origin 请求失败", false).await?;
+                write_h2_response(respond, 502, &[], b"origin request failed", false).await?;
             drop(send_stream);
             return Ok(());
         }
@@ -401,7 +423,7 @@ async fn serve_http(
         Ok(()) => {
             h2w.finish().context("结束 H2 响应流失败")?;
             if origin::reusable(&head, framing) {
-                OriginPool::global().checkin(&origin_host, port, conn);
+                OriginPool::global().checkin(origin_host, port, conn);
             }
             Ok(())
         }
@@ -414,21 +436,24 @@ async fn serve_http(
 }
 
 async fn serve_websocket(
-    method: &str,
-    path: &str,
-    host: &str,
-    headers: &[(String, String)],
-    origin_host: String,
-    port: u16,
+    req: OriginRequest<'_>,
     recv: RecvStream,
     respond: SendResponse<Bytes>,
 ) -> Result<()> {
+    let OriginRequest {
+        method,
+        path,
+        host,
+        headers,
+        origin_host,
+        port,
+    } = req;
     // websocket 是长连接 hijack，不走连接池（与官方一致，每次单独拨号）。
-    let upstream = match TcpStream::connect((origin_host.as_str(), port)).await {
+    let upstream = match TcpStream::connect((origin_host, port)).await {
         Ok(s) => s,
         Err(e) => {
             warn!(origin = %origin_host, port, error = %e, "连接 origin 失败，返回 502");
-            let send_stream = write_h2_response(respond, 502, &[], b"origin 请求失败", false).await?;
+            let send_stream = write_h2_response(respond, 502, &[], b"origin request failed", false).await?;
             drop(send_stream);
             return Ok(());
         }
@@ -558,7 +583,7 @@ async fn write_h2_response(
 /// 流式响应专用：只发响应头（不结束流），body 由调用方按分帧逐块写入后 finish。
 /// content-length 由分帧判定结果显式给出（chunked/EOF 分帧为 None）。
 async fn write_h2_streaming_head(
-    respond: SendResponse<Bytes>,
+    mut respond: SendResponse<Bytes>,
     status: u16,
     headers: &[(String, String)],
     content_length: Option<&str>,

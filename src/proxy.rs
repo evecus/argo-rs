@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use capnp::message::ReaderOptions;
 use futures::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 // TcpStream / compat 流实现的是 tokio 的 I/O trait，用 `as _` 引入避免与 futures 同名 trait 冲突。
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use std::collections::HashMap;
 use std::sync::Arc;
