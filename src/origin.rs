@@ -4,15 +4,19 @@
 //! HTTP/1.1 keep-alive 连接池（MaxIdleConns=100，IdleConnTimeout=90s），响应体
 //! 不整段缓冲，按 Content-Length / chunked / EOF 三种分帧逐块回传 edge。
 
+use crate::config::OriginTls;
 use crate::proxy::read_response_head;
 use anyhow::{bail, Context, Result};
 use futures::AsyncWriteExt as FuturesWriteExt;
 use std::collections::HashMap;
+use std::io::Cursor;
+use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as TokioReadExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tracing::debug;
 
 /// 对齐官方默认：keepAliveConnections=100。
 const MAX_IDLE_PER_HOST: usize = 100;
@@ -22,22 +26,172 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const STREAM_CHUNK: usize = 16 * 1024;
 
 /// 一条到 origin 的 HTTP/1.1 连接：writer 直写 socket，reader 带缓冲读响应。
-/// 读写两半由 into_split 拆出（指向同一 socket），响应体读完后可整体回池复用。
+/// 读写两半指向同一 socket（明文 TCP 用 into_split，TLS 用 tokio::io::split），
+/// 响应体读完后可整体回池复用。boxed trait 统一明文与 rustls 两条路径。
 pub struct OriginConn {
-    pub writer: OwnedWriteHalf,
-    pub reader: BufReader<OwnedReadHalf>,
+    pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    pub reader: BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
 }
 
+type BoxedRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+type BoxedWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
 impl OriginConn {
-    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+    pub async fn connect(host: &str, port: u16, tls: Option<&OriginTls>) -> Result<Self> {
         let stream = TcpStream::connect((host, port))
             .await
             .with_context(|| format!("连接 origin {host}:{port} 失败"))?;
-        let (read_half, write_half) = stream.into_split();
-        Ok(Self {
-            writer: write_half,
-            reader: BufReader::new(read_half),
-        })
+        match tls {
+            None => {
+                let (read_half, write_half) = stream.into_split();
+                Ok(Self {
+                    writer: Box::new(write_half) as BoxedWrite,
+                    reader: BufReader::new(Box::new(read_half) as BoxedRead),
+                })
+            }
+            Some(tls) => {
+                let config = tls_config(tls)?;
+                let connector = TlsConnector::from(config);
+                let name = tls.server_name.as_deref().unwrap_or(host);
+                let server_name = if let Ok(ip) = name.parse::<IpAddr>() {
+                    rustls::pki_types::ServerName::from(ip)
+                } else {
+                    rustls::pki_types::ServerName::try_from(name.to_string())
+                        .with_context(|| format!("非法的 origin ServerName: {name}"))?
+                };
+                let tls_stream = tokio::time::timeout(Duration::from_secs(10), async {
+                    connector.connect(server_name.to_owned(), stream).await
+                })
+                .await
+                .context("origin TLS 握手超时")?
+                .context("origin TLS 握手失败")?;
+                let (read_half, write_half) = tokio::io::split(tls_stream);
+                Ok(Self {
+                    writer: Box::new(write_half) as BoxedWrite,
+                    reader: BufReader::new(Box::new(read_half) as BoxedRead),
+                })
+            }
+        }
+    }
+}
+
+/// TLS ClientConfig 按参数指纹缓存，避免每条连接重建证书池。
+fn tls_config(tls: &OriginTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, std::sync::Arc<rustls::ClientConfig>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let fingerprint = tls.fingerprint();
+    if let Some(config) = cache.lock().unwrap().get(&fingerprint) {
+        return Ok(config.clone());
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(ca) = &tls.ca_pool {
+        let pem = if ca.trim_start().starts_with("-----BEGIN") {
+            ca.as_bytes().to_vec()
+        } else {
+            std::fs::read(ca).with_context(|| format!("读取 origin CA 池失败: {ca}"))?
+        };
+        let certs = rustls_pemfile::certs(&mut Cursor::new(pem))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("解析 origin CA 池 PEM 失败")?;
+        bail_if_empty(&certs, &fingerprint)?;
+        for cert in certs {
+            roots.add(cert).context("写入 origin CA 池失败")?;
+        }
+    }
+
+    let builder = rustls::ClientConfig::builder();
+    let builder = if tls.no_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoCertVerifier))
+    } else {
+        builder.with_root_certificates(roots)
+    };
+    // 源站只支持 HTTP/1.1 手写请求；与官方 ForceAttemptHTTP2 的区别在此明确收敛。
+    let mut config = builder.with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let config = std::sync::Arc::new(config);
+    cache.lock().unwrap().insert(fingerprint, config.clone());
+    debug!(no_verify = tls.no_verify, "已构建 origin TLS 配置");
+    Ok(config)
+}
+
+fn bail_if_empty(certs: &[rustls::pki_types::CertificateDer<'_>], fp: &str) -> Result<()> {
+    if certs.is_empty() {
+        bail!("origin CA 池中没有证书: {fp}");
+    }
+    Ok(())
+}
+
+/// 对应官方 noTLSVerify：仅跳过证书链校验，签名仍由 ring 验证。
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// 连接池 key：含 TLS 指纹，明文/HTTPS 与不同 TLS 参数互不复用。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PoolKey {
+    pub host: String,
+    pub port: u16,
+    pub tls: String,
+}
+
+impl PoolKey {
+    pub fn new(host: &str, port: u16, tls: Option<&OriginTls>) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            tls: tls.map(OriginTls::fingerprint).unwrap_or_default(),
+        }
     }
 }
 
@@ -46,9 +200,9 @@ struct PooledConn {
     idle_since: Instant,
 }
 
-/// HTTP/1.1 keep-alive 连接池，按 (host, port) 分桶。
+/// HTTP/1.1 keep-alive 连接池，按 PoolKey 分桶。
 pub struct OriginPool {
-    conns: Mutex<HashMap<(String, u16), Vec<PooledConn>>>,
+    conns: Mutex<HashMap<PoolKey, Vec<PooledConn>>>,
 }
 
 impl OriginPool {
@@ -60,10 +214,9 @@ impl OriginPool {
     }
 
     /// 取一条空闲连接；超期连接顺手丢弃。
-    pub fn checkout(&self, host: &str, port: u16) -> Option<OriginConn> {
-        let key = (host.to_string(), port);
+    pub fn checkout(&self, key: &PoolKey) -> Option<OriginConn> {
         let mut conns = self.conns.lock().unwrap();
-        let bucket = conns.get_mut(&key)?;
+        let bucket = conns.get_mut(key)?;
         while let Some(pooled) = bucket.pop() {
             if pooled.idle_since.elapsed() < IDLE_TIMEOUT {
                 return Some(pooled.conn);
@@ -74,9 +227,9 @@ impl OriginPool {
     }
 
     /// 归还一条仍可复用的连接；超出每主机空闲上限时直接丢弃。
-    pub fn checkin(&self, host: &str, port: u16, conn: OriginConn) {
+    pub fn checkin(&self, key: &PoolKey, conn: OriginConn) {
         let mut conns = self.conns.lock().unwrap();
-        let bucket = conns.entry((host.to_string(), port)).or_default();
+        let bucket = conns.entry(key.clone()).or_default();
         if bucket.len() >= MAX_IDLE_PER_HOST {
             return;
         }

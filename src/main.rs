@@ -21,6 +21,7 @@ mod stream;
 mod supervisor;
 mod token;
 mod tls;
+mod wsframe;
 
 use anyhow::{Context, Result};
 use clap::Parser;

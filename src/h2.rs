@@ -9,9 +9,9 @@
 //! 用户 HTTP/1 头被序列化进 `cf-cloudflared-request-headers`，响应头序列化进
 //! `cf-cloudflared-response-headers`（base64 RawStd，`key:value;` 串接）。
 
-use crate::config::{ConfigStore, Service};
+use crate::config::{ConfigStore, OriginTls, Service};
 use crate::h2io::{H2Reader, H2Writer};
-use crate::origin::{self, OriginConn, OriginHead, OriginPool};
+use crate::origin::{self, OriginConn, OriginHead, OriginPool, PoolKey};
 use crate::proxy::{parse_http_response, read_response_head};
 use crate::rpc::Registration;
 use crate::token::TunnelToken;
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -287,9 +287,21 @@ async fn serve_data_stream(
 
     let target = config.resolve(&host, &path);
     let recv = request.into_body();
-    let (origin_host, port, host) = match target.service {
-        Service::Http { host: origin_host, port } => {
-            (origin_host, port, target.host_header.unwrap_or(host))
+    let (origin_host, port, host, tls) = match target.service {
+        Service::Http { host: origin_host, port, tls } => {
+            (origin_host, port, target.host_header.unwrap_or(host), tls)
+        }
+        Service::Tcp { host, port } => {
+            if !is_ws {
+                warn!(%host, port, "TCP service 收到非 WebSocket 请求，返回 502");
+                let send_stream =
+                    write_h2_response(respond, 502, &[], b"tcp service requires websocket", false)
+                        .await?;
+                drop(send_stream);
+                return Ok(());
+            }
+            serve_tcp_tunnel(&host, port, &headers, recv, respond).await?;
+            return Ok(());
         }
         Service::Status(code) => {
             debug!(%host, %path, code, "命中 http_status 规则");
@@ -313,6 +325,7 @@ async fn serve_data_stream(
         headers: &headers,
         origin_host: &origin_host,
         port,
+        tls: tls.as_ref(),
     };
     if is_ws {
         serve_websocket(req, recv, respond).await
@@ -329,6 +342,7 @@ struct OriginRequest<'a> {
     headers: &'a [(String, String)],
     origin_host: &'a str,
     port: u16,
+    tls: Option<&'a OriginTls>,
 }
 
 /// 取一条可用 origin 连接并发请求、读响应头：优先复用池内 keep-alive 连接，
@@ -336,16 +350,18 @@ struct OriginRequest<'a> {
 async fn request_origin(
     origin_host: &str,
     port: u16,
+    tls: Option<&OriginTls>,
     head: &[u8],
     body: &[u8],
 ) -> Result<(OriginConn, OriginHead)> {
-    if let Some(mut conn) = OriginPool::global().checkout(origin_host, port) {
+    let key = PoolKey::new(origin_host, port, tls);
+    if let Some(mut conn) = OriginPool::global().checkout(&key) {
         match send_origin_request(&mut conn, head, body).await {
             Ok(head) => return Ok((conn, head)),
             Err(e) => debug!(error = format!("{e:#}"), "复用的 origin 连接已失效，重建连接"),
         }
     }
-    let mut conn = OriginConn::connect(origin_host, port).await?;
+    let mut conn = OriginConn::connect(origin_host, port, tls).await?;
     let head = send_origin_request(&mut conn, head, body).await?;
     Ok((conn, head))
 }
@@ -370,6 +386,7 @@ async fn serve_http(
         headers,
         origin_host,
         port,
+        tls,
     } = req;
     // 读请求体（H2 用流结束标记界定长度）。
     let mut body = Vec::new();
@@ -391,8 +408,8 @@ async fn serve_http(
     req_bytes.push_str("\r\n");
 
     // 连接/发送/读响应头失败统一回 502：访客拿到明确的网关错误而不是断流。
-    let (mut conn, head) = match request_origin(origin_host, port, req_bytes.as_bytes(), &body).await
-    {
+    let (mut conn, head) =
+        match request_origin(origin_host, port, tls, req_bytes.as_bytes(), &body).await {
         Ok(ok) => ok,
         Err(e) => {
             warn!(error = format!("{e:#}"), "origin 请求失败，返回 502");
@@ -423,7 +440,7 @@ async fn serve_http(
         Ok(()) => {
             h2w.finish().context("结束 H2 响应流失败")?;
             if origin::reusable(&head, framing) {
-                OriginPool::global().checkin(origin_host, port, conn);
+                OriginPool::global().checkin(&PoolKey::new(origin_host, port, tls), conn);
             }
             Ok(())
         }
@@ -447,9 +464,11 @@ async fn serve_websocket(
         headers,
         origin_host,
         port,
+        tls,
     } = req;
     // websocket 是长连接 hijack，不走连接池（与官方一致，每次单独拨号）。
-    let upstream = match TcpStream::connect((origin_host, port)).await {
+    // HTTPS 回源（wss）在此复用 OriginConn 的 TLS 分支。
+    let mut upstream = match OriginConn::connect(origin_host, port, tls).await {
         Ok(s) => s,
         Err(e) => {
             warn!(origin = %origin_host, port, error = %e, "连接 origin 失败，返回 502");
@@ -458,13 +477,11 @@ async fn serve_websocket(
             return Ok(());
         }
     };
-    let mut upstream = upstream;
     let req = build_origin_request(method, path, host, headers, true);
-    upstream.write_all(req.as_bytes()).await?;
+    upstream.writer.write_all(req.as_bytes()).await?;
 
     // 只读响应头到 \r\n\r\n，绝不 read_to_end（101 后连接保持打开）。
-    let mut buf = tokio::io::BufReader::new(upstream);
-    let head = read_response_head(&mut buf).await?;
+    let head = read_response_head(&mut upstream.reader).await?;
     let (status, resp_headers, _) = parse_http_response(&head)?;
     if status != 101 {
         warn!(status, "origin 未返回 101，WebSocket 升级失败");
@@ -479,20 +496,58 @@ async fn serve_websocket(
     // hijack=true 时只发头，不写 body 也不结束流。
     let send_stream = write_h2_response(respond, 101, &resp_headers, b"", true).await?;
 
-    // 握手完成，两侧裸字节双向透传。h2 流用适配器，origin 保留 tokio I/O。
-    let edge_read = H2Reader::new(recv).compat();
-    let edge_write = H2Writer::new(send_stream).compat_write();
-    tokio::pin!(edge_read);
-    tokio::pin!(edge_write);
-    let (mut up_read, mut up_write) = tokio::io::split(buf);
+    // 握手完成，两侧裸字节双向透传。origin 侧 boxed tokio 流转 futures，
+    // H2 流侧用 H2Reader/H2Writer 直接作为 futures I/O。
+    let mut edge_read = H2Reader::new(recv);
+    let mut edge_write = H2Writer::new(send_stream);
+    let mut up_read = upstream.reader.compat();
+    let mut up_write = upstream.writer.compat_write();
 
-    let to_origin = tokio::io::copy(&mut edge_read, &mut up_write);
-    let to_edge = tokio::io::copy(&mut up_read, &mut edge_write);
+    let to_origin = futures::io::copy(&mut edge_read, &mut up_write);
+    let to_edge = futures::io::copy(&mut up_read, &mut edge_write);
     tokio::select! {
         r = to_origin => { r.context("客户端→origin 透传失败")?; },
         r = to_edge => { r.context("origin→客户端 透传失败")?; },
     }
     Ok(())
+}
+
+/// tcp/ssh/rdp/smb service（H2 路径）：edge 的 WS 请求在 cloudflared 侧终止帧，
+/// 底层字节直接转发到本地 TCP；H2 不支持 101，按官方做法改写为 200 + 升级头。
+async fn serve_tcp_tunnel(
+    host: &str,
+    port: u16,
+    headers: &[(String, String)],
+    recv: RecvStream,
+    respond: SendResponse<Bytes>,
+) -> Result<()> {
+    let upstream = match TcpStream::connect((host, port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(origin = %host, port, error = %e, "连接 TCP origin 失败，返回 502");
+            let send_stream = write_h2_response(respond, 502, &[], b"origin request failed", false).await?;
+            drop(send_stream);
+            return Ok(());
+        }
+    };
+    let key = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-key"))
+        .map(|(_, value)| value.as_str());
+    let Some(key) = key else {
+        let send_stream =
+            write_h2_response(respond, 502, &[], b"tcp service missing websocket key", false).await?;
+        drop(send_stream);
+        return Ok(());
+    };
+    let response_headers = vec![
+        ("Upgrade".to_string(), "websocket".to_string()),
+        ("Connection".to_string(), "Upgrade".to_string()),
+        ("Sec-WebSocket-Accept".to_string(), crate::wsframe::accept_key(key)),
+    ];
+    let send_stream = write_h2_response(respond, 101, &response_headers, b"", true).await?;
+    debug!(%host, port, "TCP service 握手完成，进入 WS 帧隧道");
+    crate::wsframe::pump(H2Reader::new(recv), H2Writer::new(send_stream), upstream).await
 }
 
 /// 把 edge 的请求头拼成 HTTP/1.1 请求发给 origin。

@@ -1,6 +1,6 @@
 # argo-rs
 
-参考官方 `cloudflared` 源码（2026.11.1）用 Rust 重写的精简版 Cloudflare Tunnel 客户端。目标：**用官方 token 连上 Cloudflare edge、完成注册、保持连接、优雅注销**，本地网页配置路由端口，支持基础 HTTP / WebSocket 数据转发，并实现 **QUIC 优先、HTTP/2 回退** 的双传输（`--protocol auto`，默认）。
+参考官方 `cloudflared` 源码（2026.11.1）用 Rust 重写的精简版 Cloudflare Tunnel 客户端。目标：**用官方 token 连上 Cloudflare edge、完成注册、保持连接、优雅注销**，由 edge 远程下发 ingress 路由，支持 HTTP(HTTPS) / WebSocket / 本地 TCP（ssh/rdp/smb）转发，并实现 **QUIC 优先、HTTP/2 回退** 的双传输（`--protocol auto`，默认）。
 
 > 注意：下面的“已验证”记录来自单连接 + 本地路由文件的旧版本。多连接（HA）与远程路由配置为后续改动，
 > 其中 `config.rs` 的规则匹配有单元测试，其余需要真实 token 联调。
@@ -126,9 +126,10 @@ cargo build --release
 
 ### 远程路由配置
 
-- 支持 service：`http://host[:port]`、`http_status:NNN`；支持 `hostname`（含 `*.example.com`）、`path`（正则）、`originRequest.httpHostHeader`。
+- 支持 service：`http://host[:port]`、`https://host[:port]`（含 `originServerName` / `noTLSVerify` / `caPool`）、`http_status:NNN`、`tcp://` / `ssh://` / `rdp://` / `smb://`（本地 TCP over WebSocket，默认端口 7864/22/3389/445）；支持 `hostname`（含 `*.example.com`）、`path`（正则）、`originRequest.httpHostHeader`。
 - 规则按顺序取第一条匹配，都不匹配用最后一条；未收到任何配置前统一返回 503（与官方一致）。
-- 其它 service（`https://`、`unix:`、`tcp://`、`ssh://` 等）不支持：匹配到时返回 502 并在日志里提示。
+- 其它 service（`unix:`、`socks-proxy` 等）不支持：匹配到时返回 502 并在日志里提示。HTTPS 源站不支持 `http2Origin`（源站请求为手写 HTTP/1.1），带此配置时按 HTTP/1.1 处理。
+- 源站连接使用 keep-alive 连接池（每主机空闲 100 条、90s 超时，对齐官方默认）；HTTP 响应按 Content-Length / chunked / EOF 分帧流式回传，内存不随响应大小增长；连接或读响应头失败返回 502。
 - 版本号不高于当前版本的推送会被忽略；配置非法时保留旧配置并向 edge 回报错误。
 
 ## 模块结构
@@ -142,15 +143,17 @@ cargo build --release
 | `src/h2.rs` | HTTP/2 传输：TCP+TLS+H2 server、control-stream 注册、HTTP/WS 数据面 |
 | `src/h2io.rs` | h2 流 ↔ futures AsyncRead/Write 适配（含流控窗口管理） |
 | `src/rpc.rs` | Cap'n Proto RPC：注册/注销；QUIC 上接收 `updateConfiguration`（复用官方 schema，QUIC/H2 共用） |
-| `src/proxy.rs` | QUIC 数据流：6 字节签名 + `ConnectRequest` 解析 → HTTP 反代 |
+| `src/proxy.rs` | QUIC 数据流：6 字节签名 + `ConnectRequest` 解析 → HTTP(HTTPS)/WS/TCP 反代 |
+| `src/origin.rs` | 源站 keep-alive 连接池（明文/TLS）+ HTTP 响应流式分帧转发 |
+| `src/wsframe.rs` | 最小 WebSocket 帧编解码（TCP-over-WS 服务用：掩码帧解析、ping/pong、分片重组） |
 | `src/config.rs` | 远程下发的 ingress 规则解析与匹配（含单元测试） |
 | `src/supervisor.rs` | HA 多连接：每连接独立任务、退避重连、协议回退 |
 | `src/schema/*.capnp` | 从官方源码原样复制的 proto 定义 |
 
 ## 已知限制 / 未实现
 
-- 数据面为精简 HTTP/1.1 反代 + WebSocket 升级/双向透传，QUIC 与 HTTP/2 两条传输均已实测；未实现 UDP datagram、裸 TCP 透传
-- WebSocket 透传为逐字节 copy，不做帧解析/压缩扩展（permessage-deflate 由 origin 自行协商）
+- 数据面为精简 HTTP/1.1 反代 + WebSocket 升级/双向透传 + TCP-over-WS 裸字节隧道（本地 TCP 侧终止 WS 帧），QUIC 与 HTTP/2 两条传输均已实测；未实现 UDP datagram（WARP routing）、unix socket、socks-proxy
+- HTTP/HTTPS 的 WebSocket 透传为逐字节 copy，不做帧解析/压缩扩展（permessage-deflate 由 origin 自行协商）；只有 `tcp://` 等本地 TCP 服务会在 cloudflared 侧解析 WS 帧
 - 未实现自动更新、指标上报
 - H2 数据面按官方头序列化规则处理；`auto` 模式 QUIC 只试前 2 个 edge 以保证回退及时（强制 `--protocol quic` 才遍历全部）
 - 注销时 edge 收到请求后立即断开控制流、不回正常 response：QUIC 下 capnp 报 `Disconnected`、H2 下报 `stream closed`，本实现均识别为「注销已接受」
