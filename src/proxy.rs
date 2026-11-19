@@ -1,4 +1,5 @@
 use crate::config::{ConfigStore, Service};
+use crate::origin::{self, OriginConn, OriginHead, OriginPool};
 use crate::quic_metadata_protocol_capnp as quic_schema;
 use crate::stream::QuinnDuplex;
 use anyhow::{bail, Context, Result};
@@ -141,7 +142,8 @@ async fn read_and_dispatch(
     }
 }
 
-/// 普通 HTTP：读请求体 → 发 origin → read_to_end 响应 → 一次性写回。
+/// 普通 HTTP：读请求体 → 经连接池发 origin → 响应头解析后，响应体按分帧
+/// （Content-Length / chunked / EOF）逐块流式回传 edge，内存占用不随文件大小增长。
 async fn serve_http(reader: &mut EdgeReader, writer: &mut EdgeWriter, info: RequestInfo) -> Result<()> {
     let content_length = info
         .metadata
@@ -153,28 +155,77 @@ async fn serve_http(reader: &mut EdgeReader, writer: &mut EdgeWriter, info: Requ
         reader.read_exact(&mut body).await.context("读取请求体失败")?;
     }
 
-    let mut upstream = TcpStream::connect((info.origin_host.as_str(), info.port))
-        .await
-        .with_context(|| format!("连接 origin {}:{} 失败", info.origin_host, info.port))?;
+    // 连接/发送/读响应头失败统一回 502：访客拿到明确的网关错误，
+    // 而不是 edge 的断流错误页。
+    let (mut conn, head) = match request_origin(&info, &body).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "origin 请求失败，返回 502");
+            write_error(writer, 502, &format!("origin 请求失败: {e:#}")).await?;
+            return Ok(());
+        }
+    };
 
+    let framing = origin::classify(&head, &info.method);
+    let headers = origin::forward_headers(&head, framing);
+    write_connect_response(writer, head.status, &headers).await?;
+    writer.flush().await?;
+
+    let streamed = match framing {
+        origin::Framing::None => Ok(()),
+        origin::Framing::Length(n) => origin::copy_exact(&mut conn.reader, writer, n).await,
+        origin::Framing::Chunked => origin::copy_chunked(&mut conn.reader, writer).await,
+        origin::Framing::Eof => origin::copy_until_eof(&mut conn.reader, writer).await,
+    };
+    match streamed {
+        Ok(()) => {
+            if origin::reusable(&head, framing) {
+                OriginPool::global().checkin(&info.origin_host, info.port, conn);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // 中途失败（origin 断开或访客中断）：连接作废不回池，错误上抛由调用方记录。
+            Err(e)
+        }
+    }
+}
+
+/// 取一条可用 origin 连接并发请求、读响应头：优先复用池内 keep-alive 连接，
+/// 失效则重建一次；新建连接失败意味着 origin 不可达，直接上抛（调用方回 502）。
+async fn request_origin(info: &RequestInfo, body: &[u8]) -> Result<(OriginConn, OriginHead)> {
+    let head_bytes = build_request_head(info, body.len());
+
+    if let Some(mut conn) = OriginPool::global().checkout(&info.origin_host, info.port) {
+        match send_request(&mut conn, &head_bytes, body).await {
+            Ok(head) => return Ok((conn, head)),
+            Err(e) => debug!(error = format!("{e:#}"), "复用的 origin 连接已失效，重建连接"),
+        }
+    }
+    let mut conn = OriginConn::connect(&info.origin_host, info.port).await?;
+    let head = send_request(&mut conn, &head_bytes, body).await?;
+    Ok((conn, head))
+}
+
+/// 拼 HTTP/1.1 请求头。不发 `Connection: close`，HTTP/1.1 默认 keep-alive，
+/// 响应读完后连接可回池复用。
+fn build_request_head(info: &RequestInfo, body_len: usize) -> Vec<u8> {
     let mut headers = String::new();
     headers.push_str(&format!("{} {} HTTP/1.1\r\n", info.method, info.path));
     headers.push_str(&format!("Host: {}\r\n", info.host));
     let mut present = Vec::new();
     append_request_headers(&mut headers, &info.metadata, true, &mut present);
-    headers.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    headers.push_str("Connection: close\r\n\r\n");
-    upstream.write_all(headers.as_bytes()).await?;
-    upstream.write_all(&body).await?;
+    headers.push_str(&format!("Content-Length: {}\r\n", body_len));
+    headers.push_str("\r\n");
+    headers.into_bytes()
+}
 
-    let mut response = Vec::new();
-    upstream.read_to_end(&mut response).await.context("读取本地服务响应失败")?;
-    let (status, response_headers, resp_body) = parse_http_response(&response)?;
-
-    write_connect_response(writer, status, &response_headers).await?;
-    writer.write_all(resp_body).await?;
-    writer.flush().await?;
-    Ok(())
+async fn send_request(conn: &mut OriginConn, head: &[u8], body: &[u8]) -> Result<OriginHead> {
+    conn.writer.write_all(head).await.context("发送请求到 origin 失败")?;
+    if !body.is_empty() {
+        conn.writer.write_all(body).await.context("发送请求体到 origin 失败")?;
+    }
+    origin::read_head(conn).await
 }
 
 /// WebSocket：发 Upgrade 请求 → 读 origin 的 101 响应头 → 回写 ConnectResponse → 双向裸字节透传。
@@ -183,9 +234,15 @@ async fn serve_websocket(
     writer: &mut EdgeWriter,
     info: RequestInfo,
 ) -> Result<()> {
-    let mut upstream = TcpStream::connect((info.origin_host.as_str(), info.port))
-        .await
-        .with_context(|| format!("连接 origin {}:{} 失败", info.origin_host, info.port))?;
+    // websocket 是长连接 hijack，不走连接池（与官方一致，每次单独拨号）。
+    let mut upstream = match TcpStream::connect((info.origin_host.as_str(), info.port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(origin = %info.origin_host, port = info.port, error = %e, "连接 origin 失败，返回 502");
+            write_error(writer, 502, &format!("origin 请求失败: {e}")).await?;
+            return Ok(());
+        }
+    };
 
     // 官方 proxyHTTPRequest：websocket 请求无 body，并补齐缺失的升级头。
     // edge 通常已透传 Sec-WebSocket-Key/Version/Upgrade/Connection，重复追加会导致

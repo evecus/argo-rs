@@ -11,6 +11,7 @@
 
 use crate::config::{ConfigStore, Service};
 use crate::h2io::{H2Reader, H2Writer};
+use crate::origin::{self, OriginConn, OriginHead, OriginPool};
 use crate::proxy::{parse_http_response, read_response_head};
 use crate::rpc::Registration;
 use crate::token::TunnelToken;
@@ -24,7 +25,7 @@ use h2::{RecvStream, SendStream};
 use http::{Request, Response, StatusCode};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
@@ -305,15 +306,38 @@ async fn serve_data_stream(
     };
     debug!(%host, %path, %origin_host, port, is_ws, "H2 转发到 origin");
 
-    let upstream = TcpStream::connect((origin_host.as_str(), port))
-        .await
-        .with_context(|| format!("连接 origin {}:{} 失败", origin_host, port))?;
-
     if is_ws {
-        serve_websocket(&method, &path, &host, &headers, upstream, recv, respond).await
+        serve_websocket(&method, &path, &host, &headers, origin_host, port, recv, respond).await
     } else {
-        serve_http(&method, &path, &host, &headers, recv, upstream, respond).await
+        serve_http(&method, &path, &host, &headers, origin_host, port, recv, respond).await
     }
+}
+
+/// 取一条可用 origin 连接并发请求、读响应头：优先复用池内 keep-alive 连接，
+/// 失效则重建一次；新建连接失败意味着 origin 不可达，直接上抛（调用方回 502）。
+async fn request_origin(
+    origin_host: &str,
+    port: u16,
+    head: &[u8],
+    body: &[u8],
+) -> Result<(OriginConn, OriginHead)> {
+    if let Some(mut conn) = OriginPool::global().checkout(origin_host, port) {
+        match send_origin_request(&mut conn, head, body).await {
+            Ok(head) => return Ok((conn, head)),
+            Err(e) => debug!(error = format!("{e:#}"), "复用的 origin 连接已失效，重建连接"),
+        }
+    }
+    let mut conn = OriginConn::connect(origin_host, port).await?;
+    let head = send_origin_request(&mut conn, head, body).await?;
+    Ok((conn, head))
+}
+
+async fn send_origin_request(conn: &mut OriginConn, head: &[u8], body: &[u8]) -> Result<OriginHead> {
+    conn.writer.write_all(head).await.context("发送请求到 origin 失败")?;
+    if !body.is_empty() {
+        conn.writer.write_all(body).await.context("发送请求体到 origin 失败")?;
+    }
+    origin::read_head(conn).await
 }
 
 async fn serve_http(
@@ -321,8 +345,9 @@ async fn serve_http(
     path: &str,
     host: &str,
     headers: &[(String, String)],
+    origin_host: String,
+    port: u16,
     recv: RecvStream,
-    mut upstream: TcpStream,
     respond: SendResponse<Bytes>,
 ) -> Result<()> {
     // 读请求体（H2 用流结束标记界定长度）。
@@ -341,21 +366,51 @@ async fn serve_http(
 
     let mut req = build_origin_request(method, path, host, headers, false);
     req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    req.push_str("Connection: close\r\n\r\n");
-    upstream.write_all(req.as_bytes()).await?;
-    upstream.write_all(&body).await?;
+    // 不发 Connection: close，HTTP/1.1 默认 keep-alive，连接可回池复用。
+    req.push_str("\r\n");
 
-    let mut raw = Vec::new();
-    upstream
-        .read_to_end(&mut raw)
-        .await
-        .context("读取本地服务响应失败")?;
-    let (status, resp_headers, resp_body) = parse_http_response(&raw)?;
+    // 连接/发送/读响应头失败统一回 502：访客拿到明确的网关错误而不是断流。
+    let (mut conn, head) = match request_origin(&origin_host, port, req.as_bytes(), &body).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "origin 请求失败，返回 502");
+            let send_stream =
+                write_h2_response(respond, 502, &[], b"origin 请求失败", false).await?;
+            drop(send_stream);
+            return Ok(());
+        }
+    };
 
-    let send_stream = write_h2_response(respond, status, &resp_headers, resp_body, false).await?;
-    // 非 hijack：body 已写完并显式结束流，这里丢弃 send_stream 即可。
-    drop(send_stream);
-    Ok(())
+    let framing = origin::classify(&head, method);
+    let content_length = match framing {
+        origin::Framing::Length(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let fwd = origin::forward_headers(&head, framing);
+    let send_stream =
+        write_h2_streaming_head(respond, head.status, &fwd, content_length.as_deref()).await?;
+    let mut h2w = H2Writer::new(send_stream);
+
+    let streamed = match framing {
+        origin::Framing::None => Ok(()),
+        origin::Framing::Length(n) => origin::copy_exact(&mut conn.reader, &mut h2w, n).await,
+        origin::Framing::Chunked => origin::copy_chunked(&mut conn.reader, &mut h2w).await,
+        origin::Framing::Eof => origin::copy_until_eof(&mut conn.reader, &mut h2w).await,
+    };
+    match streamed {
+        Ok(()) => {
+            h2w.finish().context("结束 H2 响应流失败")?;
+            if origin::reusable(&head, framing) {
+                OriginPool::global().checkin(&origin_host, port, conn);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // 响应头已发出无法再改 502；不 finish（send_stream 随 drop 复位流），
+            // 错误上抛由调用方记录。
+            Err(e)
+        }
+    }
 }
 
 async fn serve_websocket(
@@ -363,10 +418,21 @@ async fn serve_websocket(
     path: &str,
     host: &str,
     headers: &[(String, String)],
-    upstream: TcpStream,
+    origin_host: String,
+    port: u16,
     recv: RecvStream,
     respond: SendResponse<Bytes>,
 ) -> Result<()> {
+    // websocket 是长连接 hijack，不走连接池（与官方一致，每次单独拨号）。
+    let upstream = match TcpStream::connect((origin_host.as_str(), port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(origin = %origin_host, port, error = %e, "连接 origin 失败，返回 502");
+            let send_stream = write_h2_response(respond, 502, &[], b"origin 请求失败", false).await?;
+            drop(send_stream);
+            return Ok(());
+        }
+    };
     let mut upstream = upstream;
     let req = build_origin_request(method, path, host, headers, true);
     upstream.write_all(req.as_bytes()).await?;
@@ -460,14 +526,59 @@ async fn write_h2_response(
     body: &[u8],
     hijack: bool,
 ) -> Result<SendStream<Bytes>> {
+    // 非 hijack 时沿用 origin 的 content-length（若有）；hijack（websocket 101）
+    // 不带 body，不声明长度。
+    let content_length = if hijack {
+        None
+    } else {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+            .map(|(_, v)| v.clone())
+    };
+    let response = build_h2_response(status, headers, content_length.as_deref())?;
+    let end = body.is_empty() && !hijack;
+    let mut send_stream = respond
+        .send_response(response, end)
+        .context("发送 H2 响应头失败")?;
+
+    if !body.is_empty() {
+        let mut writer = H2Writer::new(send_stream);
+        FuturesWriteExt::write_all(&mut writer, body)
+            .await
+            .context("发送 H2 响应体失败")?;
+        if !hijack {
+            writer.finish().context("结束 H2 响应流失败")?;
+        }
+        send_stream = writer.into_inner();
+    }
+    Ok(send_stream)
+}
+
+/// 流式响应专用：只发响应头（不结束流），body 由调用方按分帧逐块写入后 finish。
+/// content-length 由分帧判定结果显式给出（chunked/EOF 分帧为 None）。
+async fn write_h2_streaming_head(
+    respond: SendResponse<Bytes>,
+    status: u16,
+    headers: &[(String, String)],
+    content_length: Option<&str>,
+) -> Result<SendStream<Bytes>> {
+    let response = build_h2_response(status, headers, content_length)?;
+    respond
+        .send_response(response, false)
+        .context("发送 H2 响应头失败")
+}
+
+/// 构造 H2 响应：过滤内部头与伪头，剥离 content-length（由调用方显式传入）。
+fn build_h2_response(
+    status: u16,
+    headers: &[(String, String)],
+    content_length: Option<&str>,
+) -> Result<Response<()>> {
     let mut user_headers: Vec<(String, String)> = Vec::new();
-    let mut content_length: Option<String> = None;
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
         if lower == "content-length" {
-            if !hijack {
-                content_length = Some(value.clone());
-            }
             continue;
         }
         let is_control = lower.starts_with(':')
@@ -492,23 +603,7 @@ async fn write_h2_response(
     builder = builder
         .header(RESPONSE_HEADERS, serialize_headers(&user_headers))
         .header(RESPONSE_META, RESPONSE_META_ORIGIN);
-    let response = builder.body(()).context("构造 H2 响应失败")?;
-    let end = body.is_empty() && !hijack;
-    let mut send_stream = respond
-        .send_response(response, end)
-        .context("发送 H2 响应头失败")?;
-
-    if !body.is_empty() {
-        let mut writer = H2Writer::new(send_stream);
-        FuturesWriteExt::write_all(&mut writer, body)
-            .await
-            .context("发送 H2 响应体失败")?;
-        if !hijack {
-            writer.finish().context("结束 H2 响应流失败")?;
-        }
-        send_stream = writer.into_inner();
-    }
-    Ok(send_stream)
+    builder.body(()).context("构造 H2 响应失败")
 }
 
 fn serialize_headers(headers: &[(String, String)]) -> String {

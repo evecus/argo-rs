@@ -13,6 +13,7 @@ mod config;
 mod discovery;
 mod h2;
 mod h2io;
+mod origin;
 mod proxy;
 mod quic;
 mod rpc;
@@ -57,7 +58,9 @@ struct Args {
     ha_connections: u8,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+// 不再限制 worker 线程数：默认按可用 CPU 核数创建 tokio worker，
+// 大流量场景下 HTTP/WebSocket 代理任务可以充分并行。
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
